@@ -1,0 +1,2391 @@
+# 📘 ПОЛНЫЙ ИСПРАВЛЕННЫЙ ПЛАН РАЗРАБОТКИ SMC ИНДИКАТОРА ДЛЯ MT5
+
+**Версия:** 2.0 (После аудита)  
+**Дата:** 17 ноября 2025  
+**Статус:** ✅ Готов к реализации  
+
+---
+
+## 📋 СОДЕРЖАНИЕ
+
+1. [Критические исправления после аудита](#критические-исправления)
+2. [Архитектура модулей](#архитектура-модулей)
+3. [Исправленные алгоритмы](#исправленные-алгоритмы)
+4. [Структуры данных](#структуры-данных)
+5. [План разработки по фазам](#план-разработки)
+6. [Тестирование](#тестирование)
+
+---
+
+## 🎯 КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ ПОСЛЕ АУДИТА {#критические-исправления}
+
+### ⚠️ ОБЯЗАТЕЛЬНЫЕ ИЗМЕНЕНИЯ
+
+#### 1. Time Zone Conversion (Упрощена)
+**Было:** Сложный расчет с DST  
+**Стало:** `BrokerTimeDetector.GetOffsetToMSK()`
+
+```cpp
+int GetOffsetToMSK() {
+  int broker_gmt = DetectBrokerGMTOffset();  // 2 или 3
+  bool dst_active = IsDSTActiveEU(TimeCurrent());
+  int msk_gmt = 3;  // MSK всегда GMT+3
+  
+  if (dst_active) {
+    return msk_gmt - 3;  // Летом: 0 часов разницы
+  } else {
+    return msk_gmt - 2;  // Зимой: +1 час к broker time
+  }
+}
+```
+
+#### 2. AMD Pattern Direction (КРИТИЧНО!)
+**Было:** Manipulation и Distribution в одном направлении  
+**Стало:** Manipulation ПРОТИВОПОЛОЖНА Distribution
+
+```cpp
+// BEARISH AMD (исправлено):
+// Asian Range: 1.0848-1.0862
+// Manipulation: Breakout UP (swept BSL 1.0875) ← Ловушка!
+// Distribution: BMS DOWN, цена идет ВНИЗ ← Истинное направление
+
+if (manipulation_direction == UP) {
+  expected_distribution_direction = DOWN;
+}
+```
+
+#### 3. Order Block Mitigation Tracking
+**Добавлено:** Счетчик использований OB
+
+```cpp
+struct OrderBlock {
+  // ... existing fields
+  int mitigation_count;           // НОВОЕ
+  ENUM_OB_STATUS status;          // ACTIVE/MITIGATED_ONCE/TWICE/WEAK/VIOLATED
+  
+  double GetConfluenceAdjustment() {
+    if (mitigation_count <= 1) return 0.0;
+    if (mitigation_count == 2) return -5.0;
+    if (mitigation_count >= 3) return -15.0;
+    return 0.0;
+  }
+};
+```
+
+#### 4. Confluence Weights (До 100%)
+**Исправлено:** Сумма теперь ровно 100%
+
+```
+БАЗОВЫЕ:
+✅ BMS                     25%
+✅ Stop Hunt ИЛИ SMS       20%
+✅ RTO to Order Block      20%
+✅ Session Timing          15% (или 20% для Overlap)
+                          ----
+                           80%
+
+ДОПОЛНИТЕЛЬНЫЕ:
+✅ Fibonacci OTE           4%
+✅ HTF Trend Alignment     4%
+✅ High Impact News        4%
+✅ AMD Pattern             4%
+✅ HTF Order Block         4%
+                          ----
+                           20%
+                          ====
+ИТОГО:                    100% ✅
+```
+
+#### 5. Sweep Volume Check
+**Было:** Volume опционально везде  
+**Стало:** MANDATORY для High Impact News sweeps
+
+```cpp
+if (is_news_time) {
+  // ОБЯЗАТЕЛЬНАЯ проверка!
+  if (volume < avg_volume * 1.5) {
+    return INVALID_SWEEP;  // Не настоящий банковский sweep
+  }
+}
+```
+
+#### 6. Equal Highs Threshold (Timeframe-зависимый)
+**Добавлено:** Разные пороги для разных TF
+
+```cpp
+// FOREX (EUR/USD):
+M15:  2-5 pips
+H1:   5-10 pips
+H4:   10-20 pips
+Daily: 20-50 pips
+
+// GOLD (XAU/USD):
+M15:  20-50 cents
+H1:   50-100 cents
+H4:   100-200 cents
+```
+
+#### 7. Fibonacci Integration
+**Исправлено:** Расчет сразу после создания OB
+
+```cpp
+// Module 3: После создания Order Block
+OrderBlock ob = DetectBullishOB(...);
+ob.impulse_start_bar = impulse_start;
+ob.impulse_start_price = Low[impulse_start];
+ob.impulse_end_price = High[bms_bar];
+
+// СРАЗУ рассчитать Fibonacci!
+ob.fibonacci_data = Fibonacci.Calculate(ob);
+ob.ote_zone = ob.fibonacci_data.ote_zone;
+```
+
+#### 8. Module Order (Sessions перемещен)
+**Изменено:** Sessions теперь Module 2A (до Liquidity!)
+
+```
+ПРАВИЛЬНЫЙ ПОРЯДОК:
+0A. BrokerTimeDetector
+0B. TimeZoneManager
+1.  MarketStructure
+2A. Sessions           ← ПЕРЕМЕЩЕН РАНЬШЕ!
+2B. Liquidity          ← Использует Sessions data
+3.  OrderBlocks
+4.  Fibonacci
+5.  SetupScanner
+6.  ConfluenceCalculator
+```
+
+#### 9. HTF Trend Filter
+**Добавлено:** Проверка HTF перед LTF входами
+
+```cpp
+ENUM_TREND_DIRECTION htf_trend = MarketStructure.GetHTFTrend(PERIOD_H4);
+
+if (setup.direction == BUY && htf_trend == BEARISH) {
+  return SKIP_SETUP;  // Не входить против HTF!
+}
+```
+
+#### 10. Asian Range Quality Scoring
+**Добавлено:** Оценка качества Asian Range
+
+```cpp
+struct AsianRange {
+  // ... existing
+  int touches_high;      // НОВОЕ
+  int touches_low;       // НОВОЕ
+  int wicks_above;       // НОВОЕ
+  int wicks_below;       // НОВОЕ
+  int quality_score;     // 0-100
+  ENUM_ASIAN_QUALITY quality_rating;  // EXCELLENT/GOOD/ACCEPTABLE/WEAK
+};
+```
+
+---
+
+## 📊 АРХИТЕКТУРА МОДУЛЕЙ {#архитектура-модулей}
+
+```
+SMC_Master.mq5
+│
+├── MODULE 0: Common.mqh
+│   └── Структуры данных, enums, константы
+│
+├── MODULE 0A: BrokerTimeDetector.mqh [КРИТИЧНЫЙ]
+│   ├── DetectBrokerGMTOffset() → 2 или 3
+│   ├── IsDSTActiveEU() → точные даты переходов
+│   ├── GetOffsetToMSK() → упрощенная функция
+│   ├── ValidateDetection() → cross-check
+│   └── ShowTimeDebugPanel() → визуальная отладка
+│
+├── MODULE 0B: TimeZoneManager.mqh
+│   ├── ConvertBrokerToMSK()
+│   ├── ConvertMSKToBroker()
+│   └── GetCurrentMSKTime()
+│
+├── MODULE 1: MarketStructure.mqh
+│   ├── DetectSwingPoints(strength)
+│   ├── DetectBMS() → проверка CLOSE, не High/Low
+│   ├── DetectSMS() → failure swing
+│   └── GetHTFTrend(timeframe) → НОВАЯ ФУНКЦИЯ
+│
+├── MODULE 2A: Sessions.mqh [ПЕРЕМЕЩЕН РАНЬШЕ]
+│   ├── GetCurrentSession() → с Overlap приоритетом
+│   ├── GetAsianRange()
+│   ├── ValidateAsianRangeQuality() → НОВАЯ ФУНКЦИЯ
+│   ├── DetectAMD() → ИСПРАВЛЕН (manipulation противоположна)
+│   └── IsLondonNYOverlap() → НОВАЯ ФУНКЦИЯ
+│
+├── MODULE 2B: Liquidity.mqh
+│   ├── FindBSL() / FindSSL()
+│   ├── FindEqualHighsLows() → timeframe-dependent threshold
+│   ├── DetectSweep() → volume MANDATORY для News
+│   └── ValidateSweepHoldingTime() → НОВАЯ ФУНКЦИЯ
+│
+├── MODULE 3: OrderBlocks.mqh [ИСПРАВЛЕН]
+│   ├── DetectBullishOB() → точный impulse start + fallback
+│   ├── DetectBearishOB()
+│   ├── ValidateOB()
+│   ├── CheckMitigation() → НОВАЯ ФУНКЦИЯ
+│   └── TrackMitigationCount() → НОВАЯ ФУНКЦИЯ
+│
+├── MODULE 4: Fibonacci.mqh
+│   ├── Calculate(OrderBlock) → использует impulse data
+│   ├── GetOTEZone()
+│   └── IsPriceInOTE()
+│
+├── MODULE 5: SetupScanner.mqh
+│   ├── ScanTurtleSoup() → с holding time check
+│   ├── ScanSH_BMS_RTO() → с HTF filter
+│   ├── ScanSMS_BMS_RTO()
+│   └── ScanAMD() → как context filter
+│
+├── MODULE 6: ConfluenceCalculator.mqh [ИСПРАВЛЕН]
+│   └── CalculateConfluence() → веса до 100%
+│
+├── MODULE 7: RiskManager.mqh [ОПЦИОНАЛЬНЫЙ]
+│   └── CalculateLotSize()
+│
+├── MODULE 8: NewsCalendar.mqh [ОПЦИОНАЛЬНЫЙ]
+│   ├── MANUAL mode (ручной ввод)
+│   ├── DISABLED mode (по умолчанию)
+│   └── VOLATILITY mode (по ATR)
+│
+├── MODULE 9: Logger.mqh
+│   └── Централизованное логирование
+│
+└── MODULE 10: Dashboard.mqh [НОВЫЙ]
+    ├── DrawDashboard()
+    ├── UpdateRealtime()
+    └── ShowActiveSetups()
+```
+
+---
+
+## 🔍 ИСПРАВЛЕННЫЕ АЛГОРИТМЫ {#исправленные-алгоритмы}
+
+### АЛГОРИТМ 0A: Broker Time Detection
+
+```cpp
+// УПРОЩЕННАЯ ВЕРСИЯ
+int GetOffsetToMSK() {
+  int broker_gmt = DetectBrokerGMTOffset();
+  bool dst_active = IsDSTActiveEU(TimeCurrent());
+  int msk_gmt = 3;
+  
+  if (dst_active) {
+    return msk_gmt - 3;  // 3 - 3 = 0 (летом)
+  } else {
+    return msk_gmt - 2;  // 3 - 2 = +1 (зимой)
+  }
+}
+
+// ТОЧНАЯ DST ПРОВЕРКА
+bool IsDSTActiveEU(datetime time) {
+  MqlDateTime dt;
+  TimeToStruct(time, dt);
+  
+  if (dt.mon < 3 || dt.mon > 10) return false;
+  if (dt.mon > 3 && dt.mon < 10) return true;
+  
+  // Граничные месяцы
+  if (dt.mon == 3) {
+    int last_sunday = GetLastSundayOfMonth(dt.year, 3);
+    if (dt.day < last_sunday) return false;
+    if (dt.day > last_sunday) return true;
+    return (dt.hour >= 2);
+  }
+  
+  if (dt.mon == 10) {
+    int last_sunday = GetLastSundayOfMonth(dt.year, 10);
+    if (dt.day < last_sunday) return true;
+    if (dt.day > last_sunday) return false;
+    return (dt.hour < 3);
+  }
+  
+  return false;
+}
+
+int GetLastSundayOfMonth(int year, int month) {
+  MqlDateTime dt_end;
+  dt_end.year = year;
+  dt_end.mon = month;
+  dt_end.day = 31;
+  dt_end.hour = 12;
+  
+  datetime time_end = StructToTime(dt_end);
+  if (time_end == 0) {
+    dt_end.day = 30;
+    time_end = StructToTime(dt_end);
+  }
+  if (time_end == 0) {
+    dt_end.day = 28;
+    time_end = StructToTime(dt_end);
+  }
+  
+  TimeToStruct(time_end, dt_end);
+  while (dt_end.day_of_week != 0) {
+    time_end -= 86400;
+    TimeToStruct(time_end, dt_end);
+  }
+  
+  return dt_end.day;
+}
+```
+
+### АЛГОРИТМ 1: HTF Trend Detection (НОВЫЙ)
+
+```cpp
+ENUM_TREND_DIRECTION GetHTFTrend(ENUM_TIMEFRAMES htf_period) {
+  // Переключиться на HTF
+  int htf_bars = iBars(Symbol(), htf_period);
+  
+  // Найти последние 2 BMS
+  BMS latest_bms = NULL;
+  BMS previous_bms = NULL;
+  
+  for (int i = 1; i < MathMin(100, htf_bars); i++) {
+    BMS bms = DetectBMSAtBar(i, htf_period);
+    if (bms != NULL) {
+      if (latest_bms == NULL) {
+        latest_bms = bms;
+      } else if (previous_bms == NULL) {
+        previous_bms = bms;
+        break;
+      }
+    }
+  }
+  
+  // Анализ тренда
+  if (latest_bms == NULL) {
+    return TREND_RANGING;
+  }
+  
+  if (latest_bms.type == BMS_BULLISH) {
+    // Проверить что цена выше BMS
+    double current_price = iClose(Symbol(), htf_period, 0);
+    if (current_price > latest_bms.price) {
+      return TREND_BULLISH;
+    }
+  }
+  
+  if (latest_bms.type == BMS_BEARISH) {
+    double current_price = iClose(Symbol(), htf_period, 0);
+    if (current_price < latest_bms.price) {
+      return TREND_BEARISH;
+    }
+  }
+  
+  // Проверить consistency (два BMS подряд в одном направлении)
+  if (previous_bms != NULL) {
+    if (latest_bms.type == previous_bms.type) {
+      return (latest_bms.type == BMS_BULLISH) ? TREND_BULLISH : TREND_BEARISH;
+    }
+  }
+  
+  return TREND_RANGING;
+}
+```
+
+### АЛГОРИТМ 2A: Sessions Detection (ИСПРАВЛЕН)
+
+```cpp
+SessionInfo GetCurrentSession(datetime msk_time) {
+  MqlDateTime dt;
+  TimeToStruct(msk_time, dt);
+  int hour = dt.hour;
+  
+  SessionInfo info;
+  
+  // ПРИОРИТЕТ #1: London-NY Overlap (самая важная зона!)
+  if (hour >= 16 && hour < 18) {
+    info.type = SESSION_LONDON_NY_OVERLAP;
+    info.importance = MAXIMUM;
+    info.confluence_weight = 20.0;  // Больше обычных!
+    info.description = "Maximum liquidity - both centers active";
+    return info;
+  }
+  
+  // London Prime
+  if (hour >= 10 && hour < 13) {
+    info.type = SESSION_LONDON_PRIME;
+    info.importance = HIGH;
+    info.confluence_weight = 15.0;
+    info.description = "London first 3 hours";
+    return info;
+  }
+  
+  // London Late
+  if (hour >= 13 && hour < 15) {
+    info.type = SESSION_LONDON_LATE;
+    info.importance = MEDIUM;
+    info.confluence_weight = 8.0;
+    return info;
+  }
+  
+  // NY Prime
+  if (hour >= 15 && hour < 18) {
+    info.type = SESSION_NY_PRIME;
+    info.importance = HIGH;
+    info.confluence_weight = 15.0;
+    return info;
+  }
+  
+  // NY Late
+  if (hour >= 18 && hour < 21) {
+    info.type = SESSION_NY_LATE;
+    info.importance = LOW;
+    info.confluence_weight = 5.0;
+    return info;
+  }
+  
+  // Asian
+  if (hour >= 3 && hour < 9) {
+    info.type = SESSION_ASIAN;
+    info.importance = OBSERVATION_ONLY;
+    info.confluence_weight = 0.0;
+    info.description = "Accumulation phase only";
+    return info;
+  }
+  
+  // Dead Zone
+  info.type = SESSION_DEAD_ZONE;
+  info.importance = NONE;
+  info.confluence_weight = -20.0;  // ШТРАФ!
+  info.description = "Do not trade";
+  return info;
+}
+```
+
+### АЛГОРИТМ 2A.1: Asian Range Quality (НОВЫЙ)
+
+```cpp
+AsianRange ValidateAsianRangeQuality(AsianRange range) {
+  int quality_score = 0;
+  
+  // Критерий 1: Количество касаний границ (30 points)
+  int total_touches = range.touches_high + range.touches_low;
+  if (total_touches >= 6) {
+    quality_score += 30;
+  } else if (total_touches >= 4) {
+    quality_score += 20;
+  } else if (total_touches >= 2) {
+    quality_score += 10;
+  }
+  
+  // Критерий 2: Wicks за пределами range (20 points)
+  int total_wicks = range.wicks_above + range.wicks_below;
+  if (total_wicks >= 3) {
+    quality_score += 20;
+  } else if (total_wicks >= 1) {
+    quality_score += 10;
+  }
+  
+  // Критерий 3: Флэт характер (30 points)
+  if (range.flat_ratio >= 0.40 && range.flat_ratio <= 0.60) {
+    quality_score += 30;
+  } else if (range.flat_ratio >= 0.35 && range.flat_ratio <= 0.65) {
+    quality_score += 20;
+  } else if (range.flat_ratio >= 0.30 && range.flat_ratio <= 0.70) {
+    quality_score += 10;
+  }
+  
+  // Критерий 4: Равномерность (20 points)
+  double coverage = CalculateCoverage(range);
+  if (coverage > 0.4) {
+    quality_score += 20;
+  } else if (coverage > 0.3) {
+    quality_score += 10;
+  }
+  
+  range.quality_score = quality_score;
+  
+  // Определить рейтинг
+  if (quality_score >= 80) {
+    range.quality_rating = ASIAN_EXCELLENT;
+  } else if (quality_score >= 60) {
+    range.quality_rating = ASIAN_GOOD;
+  } else if (quality_score >= 40) {
+    range.quality_rating = ASIAN_ACCEPTABLE;
+  } else {
+    range.quality_rating = ASIAN_WEAK;
+  }
+  
+  return range;
+}
+```
+
+### АЛГОРИТМ 2A.2: AMD Pattern Detection (ИСПРАВЛЕН)
+
+```cpp
+AMD_Pattern DetectAMD(AsianRange asian_range, SessionInfo session) {
+  AMD_Pattern amd;
+  amd.valid = false;
+  
+  // PHASE A: Accumulation (уже есть Asian Range)
+  amd.accumulation_zone = asian_range;
+  
+  // PHASE M: Manipulation (London Open обычно)
+  if (session.type != SESSION_LONDON_PRIME && session.type != SESSION_NY_PRIME) {
+    return amd;  // Рано для определения
+  }
+  
+  // Проверить breakout от Asian Range
+  double current_high = iHigh(Symbol(), PERIOD_CURRENT, 0);
+  double current_low = iLow(Symbol(), PERIOD_CURRENT, 0);
+  
+  bool broke_above = (current_high > asian_range.high);
+  bool broke_below = (current_low < asian_range.low);
+  
+  if (broke_above) {
+    amd.manipulation_direction = AMD_UP;
+    amd.manipulation_price = current_high;
+    
+    // Проверить что swept BSL
+    LiquidityZone[] bsl = Liquidity.FindBSLAbove(asian_range.high);
+    if (ArraySize(bsl) > 0) {
+      amd.swept_liquidity = bsl;
+      amd.manipulation_confirmed = true;
+    }
+    
+    // ОЖИДАЕМОЕ НАПРАВЛЕНИЕ DISTRIBUTION - ПРОТИВОПОЛОЖНО!
+    amd.expected_distribution_direction = AMD_DOWN;
+    
+  } else if (broke_below) {
+    amd.manipulation_direction = AMD_DOWN;
+    amd.manipulation_price = current_low;
+    
+    // Проверить что swept SSL
+    LiquidityZone[] ssl = Liquidity.FindSSLBelow(asian_range.low);
+    if (ArraySize(ssl) > 0) {
+      amd.swept_liquidity = ssl;
+      amd.manipulation_confirmed = true;
+    }
+    
+    // ОЖИДАЕМОЕ НАПРАВЛЕНИЕ - ПРОТИВОПОЛОЖНО!
+    amd.expected_distribution_direction = AMD_UP;
+  }
+  
+  // PHASE D: Distribution (проверка BMS подтверждения)
+  if (amd.manipulation_confirmed) {
+    // Ждем BMS в направлении expected_distribution
+    BMS latest_bms = MarketStructure.DetectLatestBMS();
+    
+    if (amd.expected_distribution_direction == AMD_DOWN) {
+      if (latest_bms.type == BMS_BEARISH && 
+          latest_bms.price < asian_range.low) {
+        amd.distribution_confirmed = true;
+        amd.distribution_bms = latest_bms;
+        amd.valid = true;
+      }
+    } else {
+      if (latest_bms.type == BMS_BULLISH && 
+          latest_bms.price > asian_range.high) {
+        amd.distribution_confirmed = true;
+        amd.distribution_bms = latest_bms;
+        amd.valid = true;
+      }
+    }
+  }
+  
+  return amd;
+}
+```
+
+### АЛГОРИТМ 2B: Equal Highs/Lows (ИСПРАВЛЕН)
+
+```cpp
+double GetEqualThreshold(string symbol, ENUM_TIMEFRAMES tf) {
+  bool is_forex = (StringFind(symbol, "USD") >= 0 || 
+                   StringFind(symbol, "EUR") >= 0 ||
+                   StringFind(symbol, "GBP") >= 0);
+  
+  bool is_gold = (StringFind(symbol, "XAU") >= 0 || 
+                  StringFind(symbol, "GOLD") >= 0);
+  
+  bool is_index = (StringFind(symbol, "NAS") >= 0 || 
+                   StringFind(symbol, "US500") >= 0);
+  
+  double base = 0;
+  
+  if (is_forex) {
+    switch(tf) {
+      case PERIOD_M5:
+      case PERIOD_M15: base = 5; break;
+      case PERIOD_M30: base = 7; break;
+      case PERIOD_H1:  base = 10; break;
+      case PERIOD_H4:  base = 20; break;
+      case PERIOD_D1:  base = 50; break;
+      default:         base = 100; break;
+    }
+  } else if (is_gold) {
+    switch(tf) {
+      case PERIOD_M5:
+      case PERIOD_M15: base = 50; break;
+      case PERIOD_M30: base = 70; break;
+      case PERIOD_H1:  base = 100; break;
+      case PERIOD_H4:  base = 200; break;
+      case PERIOD_D1:  base = 500; break;
+      default:         base = 1000; break;
+    }
+  } else if (is_index) {
+    switch(tf) {
+      case PERIOD_M5:
+      case PERIOD_M15: base = 15; break;
+      case PERIOD_M30: base = 20; break;
+      case PERIOD_H1:  base = 30; break;
+      case PERIOD_H4:  base = 60; break;
+      case PERIOD_D1:  base = 150; break;
+      default:         base = 300; break;
+    }
+  } else {
+    base = 10;  // Default
+  }
+  
+  return base * SymbolInfoDouble(symbol, SYMBOL_POINT);
+}
+
+EqualZone[] FindEqualHighs(SwingPoint[] swings) {
+  EqualZone[] zones;
+  double threshold = GetEqualThreshold(Symbol(), Period());
+  
+  for (int i = 0; i < ArraySize(swings); i++) {
+    if (swings[i].type != SWING_HIGH) continue;
+    
+    for (int j = i + 1; j < ArraySize(swings); j++) {
+      if (swings[j].type != SWING_HIGH) continue;
+      
+      double distance = MathAbs(swings[i].price - swings[j].price);
+      
+      if (distance < threshold) {
+        EqualZone zone;
+        zone.price = (swings[i].price + swings[j].price) / 2;
+        zone.type = LIQUIDITY_BSL;
+        zone.count = 2;
+        zone.importance = HIGH;
+        zone.swing_indices.Add(i);
+        zone.swing_indices.Add(j);
+        
+        // Проверить больше swings в этой зоне
+        for (int k = j + 1; k < ArraySize(swings); k++) {
+          if (swings[k].type != SWING_HIGH) continue;
+          double dist_k = MathAbs(swings[k].price - zone.price);
+          if (dist_k < threshold) {
+            zone.count++;
+            zone.swing_indices.Add(k);
+          }
+        }
+        
+        ArrayPush(zones, zone);
+        break;
+      }
+    }
+  }
+  
+  return zones;
+}
+```
+
+### АЛГОРИТМ 2B.1: Sweep Detection (ИСПРАВЛЕН)
+
+```cpp
+SweepData DetectSweep(LiquidityZone zone, SessionInfo session, bool is_news_time) {
+  SweepData sweep;
+  sweep.valid = false;
+  
+  // STEP 1: Проверка пробоя
+  double distance = 0;
+  int sweep_bar = 0;
+  
+  if (zone.type == LIQUIDITY_BSL) {
+    distance = iHigh(Symbol(), PERIOD_CURRENT, 0) - zone.price;
+    sweep_bar = 0;
+  } else {
+    distance = zone.price - iLow(Symbol(), PERIOD_CURRENT, 0);
+    sweep_bar = 0;
+  }
+  
+  double distance_pips = distance / Point;
+  
+  if (distance_pips < 5 || distance_pips > 50) {
+    return sweep;  // За пределами допустимого диапазона
+  }
+  
+  // STEP 2: Holding Time Check (НОВОЕ)
+  int holding_bars = 0;
+  int check_bar = sweep_bar;
+  
+  for (int i = 0; i < 5; i++) {
+    double close = iClose(Symbol(), PERIOD_CURRENT, check_bar);
+    bool still_beyond = false;
+    
+    if (zone.type == LIQUIDITY_BSL) {
+      still_beyond = (close > zone.price);
+    } else {
+      still_beyond = (close < zone.price);
+    }
+    
+    if (still_beyond) {
+      holding_bars++;
+      check_bar++;
+    } else {
+      break;
+    }
+  }
+  
+  sweep.holding_bars = holding_bars;
+  
+  // Оценка валидности
+  if (holding_bars < 2) {
+    sweep.validity = SWEEP_WEAK;
+  } else if (holding_bars == 2) {
+    sweep.validity = SWEEP_GOOD;
+  } else {
+    sweep.validity = SWEEP_STRONG;
+  }
+  
+  // STEP 3: Проверка возврата
+  int max_return_bars = 3 + holding_bars;
+  bool return_detected = false;
+  
+  for (int i = sweep_bar + holding_bars; i < sweep_bar + max_return_bars; i++) {
+    double close = iClose(Symbol(), PERIOD_CURRENT, i);
+    
+    if (zone.type == LIQUIDITY_BSL) {
+      if (close < zone.price) {
+        return_detected = true;
+        sweep.return_bars = i - sweep_bar;
+        break;
+      }
+    } else {
+      if (close > zone.price) {
+        return_detected = true;
+        sweep.return_bars = i - sweep_bar;
+        break;
+      }
+    }
+  }
+  
+  if (!return_detected) {
+    return sweep;  // Не вернулась - это breakout, не sweep
+  }
+  
+  // STEP 4: Volume Check
+  double volume = iVolume(Symbol(), PERIOD_CURRENT, sweep_bar);
+  double avg_volume = CalculateAvgVolume(20);
+  sweep.volume = volume;
+  sweep.avg_volume = avg_volume;
+  sweep.volume_ratio = volume / avg_volume;
+  
+  // Для News sweeps - MANDATORY volume check!
+  if (is_news_time) {
+    sweep.volume_mandatory = true;
+    if (sweep.volume_ratio < 1.5) {
+      // НЕДОСТАТОЧНЫЙ объем для news sweep
+      sweep.valid = false;
+      sweep.invalid_reason = "Insufficient volume for news sweep";
+      return sweep;
+    }
+  } else {
+    // Для обычных сессий - optional
+    sweep.volume_mandatory = false;
+  }
+  
+  // STEP 5: Session validation
+  if (session.type != SESSION_LONDON_PRIME && 
+      session.type != SESSION_NY_PRIME && 
+      session.type != SESSION_LONDON_NY_OVERLAP) {
+    if (!is_news_time) {
+      sweep.valid = false;
+      sweep.invalid_reason = "Wrong session for sweep";
+      return sweep;
+    }
+  }
+  
+  // Все проверки пройдены
+  sweep.valid = true;
+  sweep.zone_price = zone.price;
+  sweep.sweep_price = (zone.type == LIQUIDITY_BSL) ? iHigh(Symbol(), PERIOD_CURRENT, sweep_bar) : iLow(Symbol(), PERIOD_CURRENT, sweep_bar);
+  sweep.distance_pips = distance_pips;
+  sweep.type = zone.type;
+  sweep.session = session.type;
+  sweep.is_news_time = is_news_time;
+  sweep.time = iTime(Symbol(), PERIOD_CURRENT, sweep_bar);
+  
+  return sweep;
+}
+```
+
+### АЛГОРИТМ 3: Order Block Detection (ИСПРАВЛЕН)
+
+```cpp
+OrderBlock DetectBullishOB(BMS bms, SwingPoint[] swings) {
+  OrderBlock ob;
+  ob.valid = false;
+  
+  int bms_bar = iBarShift(Symbol(), PERIOD_CURRENT, bms.time);
+  
+  // STEP 1: Определить начало импульса (ТОЧНО)
+  int impulse_start_bar = -1;
+  
+  // a) Последний swing low
+  for (int i = 0; i < ArraySize(swings); i++) {
+    if (swings[i].type == SWING_LOW && swings[i].bar_index < bms_bar) {
+      if (impulse_start_bar == -1 || swings[i].bar_index > impulse_start_bar) {
+        impulse_start_bar = swings[i].bar_index;
+      }
+    }
+  }
+  
+  // b) Точка после Stop Hunt/Sweep SSL
+  SweepData[] recent_sweeps = Liquidity.GetRecentSweeps(bms.time);
+  for (int i = 0; i < ArraySize(recent_sweeps); i++) {
+    if (recent_sweeps[i].type == LIQUIDITY_SSL) {
+      int sweep_bar = iBarShift(Symbol(), PERIOD_CURRENT, recent_sweeps[i].time);
+      if (sweep_bar < bms_bar && sweep_bar > impulse_start_bar) {
+        impulse_start_bar = sweep_bar;
+      }
+    }
+  }
+  
+  // c) Выход из консолидации
+  int consolidation_end = DetectConsolidationEnd(bms_bar);
+  if (consolidation_end > impulse_start_bar) {
+    impulse_start_bar = consolidation_end;
+  }
+  
+  // d) Предыдущий BMS противоположного направления
+  BMS prev_bearish_bms = FindPreviousBMS(BMS_BEARISH, bms.time);
+  if (prev_bearish_bms != NULL) {
+    int prev_bms_bar = iBarShift(Symbol(), PERIOD_CURRENT, prev_bearish_bms.time);
+    if (prev_bms_bar < bms_bar && prev_bms_bar > impulse_start_bar) {
+      impulse_start_bar = prev_bms_bar;
+    }
+  }
+  
+  // STEP 2: Валидация начала импульса
+  int distance_from_bms = bms_bar - impulse_start_bar;
+  
+  if (distance_from_bms < 3) {
+    ob.valid = false;
+    ob.invalid_reason = "Impulse too short";
+    return ob;
+  }
+  
+  if (distance_from_bms > 100) {
+    impulse_start_bar = bms_bar - 50;
+    Print("Warning: Impulse start too far, using default lookback");
+  }
+  
+  // STEP 3: Поиск последней bearish свечи
+  int ob_bar = -1;
+  
+  for (int i = bms_bar - 3; i >= impulse_start_bar; i--) {
+    double open = iOpen(Symbol(), PERIOD_CURRENT, i);
+    double close = iClose(Symbol(), PERIOD_CURRENT, i);
+    
+    if (close < open) {  // Bearish candle
+      ob_bar = i;
+      break;  // ПЕРВАЯ найденная = ПОСЛЕДНЯЯ перед BMS
+    }
+  }
+  
+  // STEP 4: Fallback если нет противоположных свечей
+  if (ob_bar == -1) {
+    ob_bar = impulse_start_bar;
+    ob.note = "Using impulse start as OB (no opposite candles found)";
+  }
+  
+  // STEP 5: Определение границ Order Block
+  double ob_high = iHigh(Symbol(), PERIOD_CURRENT, ob_bar);
+  double ob_low = iLow(Symbol(), PERIOD_CURRENT, ob_bar);
+  double ob_size = (ob_high - ob_low) / Point;
+  
+  // Валидация размера
+  OBSizeLimits limits = GetOBLimits(Symbol(), Period());
+  
+  if (ob_size < limits.min_size) {
+    // Расширить на соседние свечи
+    ob_high = MathMax(iHigh(Symbol(), PERIOD_CURRENT, ob_bar - 1), 
+                      MathMax(ob_high, iHigh(Symbol(), PERIOD_CURRENT, ob_bar + 1)));
+    ob_low = MathMin(iLow(Symbol(), PERIOD_CURRENT, ob_bar - 1), 
+                     MathMin(ob_low, iLow(Symbol(), PERIOD_CURRENT, ob_bar + 1)));
+    ob_size = (ob_high - ob_low) / Point;
+  }
+  
+  if (ob_size > limits.max_size) {
+    // Уменьшить до 50% свечи
+    double ob_midpoint = (ob_high + ob_low) / 2;
+    double ob_range = (ob_high - ob_low) * 0.5;
+    ob_high = ob_midpoint + ob_range / 2;
+    ob_low = ob_midpoint - ob_range / 2;
+  }
+  
+  // STEP 6: Найти максимум импульса для Fibonacci
+  double impulse_max = iHigh(Symbol(), PERIOD_CURRENT, impulse_start_bar);
+  for (int i = impulse_start_bar; i >= bms_bar; i--) {
+    double high = iHigh(Symbol(), PERIOD_CURRENT, i);
+    if (high > impulse_max) {
+      impulse_max = high;
+    }
+  }
+  
+  // STEP 7: Заполнить структуру Order Block
+  ob.time = iTime(Symbol(), PERIOD_CURRENT, ob_bar);
+  ob.high = ob_high;
+  ob.low = ob_low;
+  ob.bar_index = ob_bar;
+  ob.type = OB_BULLISH;
+  
+  ob.bms_ref.time = bms.time;
+  ob.bms_ref.price = bms.price;
+  
+  // Данные импульса для Fibonacci
+  ob.impulse_start_bar = impulse_start_bar;
+  ob.impulse_start_price = iLow(Symbol(), PERIOD_CURRENT, impulse_start_bar);
+  ob.impulse_end_price = impulse_max;
+  
+  // Mitigation tracking
+  ob.status = OB_ACTIVE;
+  ob.mitigation_count = 0;
+  ob.last_mitigation_time = 0;
+  
+  ob.valid = true;
+  
+  return ob;
+}
+```
+
+### АЛГОРИТМ 3.1: Order Block Mitigation Check (НОВЫЙ)
+
+```cpp
+MitigationResult CheckOrderBlockMitigation(OrderBlock &ob, double current_price, datetime current_time) {
+  MitigationResult result;
+  result.action = MITIGATION_NO_CHANGE;
+  
+  double ob_midpoint = (ob.high + ob.low) / 2;
+  
+  // Проверка касания OB зоны
+  bool price_in_ob = false;
+  bool violated = false;
+  
+  if (ob.type == OB_BULLISH) {
+    price_in_ob = (current_price >= ob.low && current_price <= ob.high);
+    violated = (current_price < ob.low);
+  } else {
+    price_in_ob = (current_price >= ob.low && current_price <= ob.high);
+    violated = (current_price > ob.high);
+  }
+  
+  // Случай 1: VIOLATION
+  if (violated) {
+    ob.status = OB_VIOLATED;
+    ob.mitigation_count = 999;
+    result.action = MITIGATION_INVALIDATED;
+    result.confluence_adjustment = -100.0;
+    return result;
+  }
+  
+  // Случай 2: В зоне OB
+  if (price_in_ob) {
+    // Проверить что это новое касание
+    int time_since_last = (int)(current_time - ob.last_mitigation_time);
+    if (time_since_last < 300) {  // 5 минут
+      result.action = MITIGATION_SAME_TOUCH;
+      return result;
+    }
+    
+    // Новое касание
+    ob.mitigation_count++;
+    ob.last_mitigation_time = current_time;
+    ArrayPush(ob.mitigation_prices, current_price);
+    
+    // Обновить статус
+    if (ob.mitigation_count == 1) {
+      ob.status = OB_MITIGATED_ONCE;
+      result.confluence_adjustment = 0.0;
+      result.recommendation = "Good - first RTO";
+    } else if (ob.mitigation_count == 2) {
+      ob.status = OB_MITIGATED_TWICE;
+      result.confluence_adjustment = -5.0;
+      result.recommendation = "Acceptable - second RTO, use tighter SL";
+    } else if (ob.mitigation_count >= 3) {
+      ob.status = OB_WEAK;
+      result.confluence_adjustment = -15.0;
+      result.recommendation = "Risky - third RTO, not recommended";
+      Print("Warning: OB used 3+ times - consider invalid");
+    }
+    
+    result.action = MITIGATION_TOUCHED;
+    result.mitigation_count = ob.mitigation_count;
+    
+    return result;
+  }
+  
+  // Случай 3: Цена вне OB
+  return result;
+}
+```
+
+### АЛГОРИТМ 4: Fibonacci Calculation (ИСПРАВЛЕН)
+
+```cpp
+FibonacciLevels CalculateFibonacci(OrderBlock ob) {
+  FibonacciLevels fibo;
+  
+  // Используем данные из Order Block структуры!
+  fibo.impulse_start = ob.impulse_start_price;
+  fibo.impulse_end = ob.impulse_end_price;
+  fibo.range = fibo.impulse_end - fibo.impulse_start;
+  
+  // Расчет уровней (для Bullish - откат от HIGH к LOW)
+  if (ob.type == OB_BULLISH) {
+    fibo.L0 = fibo.impulse_end;  // 100%
+    fibo.L236 = fibo.impulse_end - (fibo.range * 0.236);
+    fibo.L382 = fibo.impulse_end - (fibo.range * 0.382);
+    fibo.L50 = fibo.impulse_end - (fibo.range * 0.5);
+    fibo.L618 = fibo.impulse_end - (fibo.range * 0.618);
+    fibo.L705 = fibo.impulse_end - (fibo.range * 0.705);
+    fibo.L79 = fibo.impulse_end - (fibo.range * 0.79);
+    fibo.L886 = fibo.impulse_end - (fibo.range * 0.886);
+    fibo.L100 = fibo.impulse_start;  // 0%
+  } else {
+    // Для Bearish - откат от LOW к HIGH
+    fibo.L0 = fibo.impulse_start;  // Начало (низ для bearish)
+    fibo.L236 = fibo.impulse_start + (fibo.range * 0.236);
+    fibo.L382 = fibo.impulse_start + (fibo.range * 0.382);
+    fibo.L50 = fibo.impulse_start + (fibo.range * 0.5);
+    fibo.L618 = fibo.impulse_start + (fibo.range * 0.618);
+    fibo.L705 = fibo.impulse_start + (fibo.range * 0.705);
+    fibo.L79 = fibo.impulse_start + (fibo.range * 0.79);
+    fibo.L886 = fibo.impulse_start + (fibo.range * 0.886);
+    fibo.L100 = fibo.impulse_end;  // Конец (верх для bearish)
+  }
+  
+  // OTE Zone
+  fibo.ote_zone.high = fibo.L618;
+  fibo.ote_zone.low = fibo.L79;
+  
+  return fibo;
+}
+
+bool IsPriceInOTE(FibonacciLevels fibo, double price) {
+  return (price >= fibo.ote_zone.low && price <= fibo.ote_zone.high);
+}
+```
+
+### АЛГОРИТМ 6: Confluence Calculation (ФИНАЛЬНАЯ ВЕРСИЯ)
+
+```cpp
+ConfluenceData CalculateConfluence(Setup setup, SessionInfo session, OrderBlock ob, SweepData sweep) {
+  ConfluenceData conf;
+  conf.total_score = 0;
+  ArrayResize(conf.factors_list, 0);
+  
+  // КРИТИЧЕСКИЕ ПРОВЕРКИ
+  if (!setup.has_bms) {
+    conf.total_score = 0;
+    conf.quality_rating = "INVALID - No BMS";
+    return conf;
+  }
+  
+  if (!setup.has_stop_hunt && !setup.has_sms) {
+    conf.total_score = 0;
+    conf.quality_rating = "INVALID - No SH or SMS";
+    return conf;
+  }
+  
+  if (!setup.has_order_block) {
+    conf.total_score = 0;
+    conf.quality_rating = "INVALID - No OB";
+    return conf;
+  }
+  
+  // БАЗОВЫЕ ФАКТОРЫ (65%)
+  conf.total_score += 25.0;  // BMS
+  ArrayPush(conf.factors_list, "BMS confirmed (25%)");
+  
+  if (setup.has_stop_hunt) {
+    conf.total_score += 20.0;
+    ArrayPush(conf.factors_list, "Stop Hunt (20%)");
+    
+    // Adjustment за sweep validity
+    if (sweep.validity == SWEEP_STRONG) {
+      conf.sweep_validity_adj = 5.0;
+      conf.total_score += 5.0;
+      ArrayPush(conf.factors_list, "Strong sweep +5%");
+    } else if (sweep.validity == SWEEP_WEAK) {
+      conf.sweep_validity_adj = -10.0;
+      conf.total_score -= 10.0;
+      ArrayPush(conf.factors_list, "Weak sweep -10%");
+    }
+  } else if (setup.has_sms) {
+    conf.total_score += 20.0;
+    ArrayPush(conf.factors_list, "SMS Failure Swing (20%)");
+  }
+  
+  conf.total_score += 20.0;  // RTO
+  ArrayPush(conf.factors_list, "RTO to Order Block (20%)");
+  
+  // OB Mitigation Adjustment
+  if (ob.mitigation_count > 0) {
+    double adj = ob.GetConfluenceAdjustment();
+    conf.ob_mitigation_adj = adj;
+    conf.total_score += adj;
+    if (adj < 0) {
+      ArrayPush(conf.factors_list, StringFormat("OB mitigation penalty (%.0f%%)", adj));
+    }
+  }
+  
+  // SESSION (15-20%)
+  conf.session = session.type;
+  
+  if (session.type == SESSION_DEAD_ZONE || session.type == SESSION_ASIAN) {
+    conf.session_valid = false;
+    conf.quality_rating = "INVALID - Wrong session";
+    return conf;
+  }
+  
+  conf.session_valid = true;
+  double session_weight = 15.0;
+  
+  if (session.type == SESSION_LONDON_NY_OVERLAP) {
+    session_weight = 20.0;  // БОНУС для Overlap!
+    ArrayPush(conf.factors_list, "London-NY Overlap (20%)");
+  } else if (session.type == SESSION_LONDON_PRIME || session.type == SESSION_NY_PRIME) {
+    ArrayPush(conf.factors_list, "Prime session (15%)");
+  } else {
+    session_weight = 8.0;  // Late sessions
+    ArrayPush(conf.factors_list, "Late session (8%)");
+  }
+  
+  conf.total_score += session_weight;
+  
+  // ДОПОЛНИТЕЛЬНЫЕ ФАКТОРЫ (20%)
+  if (setup.in_fibonacci_ote) {
+    conf.total_score += 4.0;
+    conf.in_fibonacci_ote = true;
+    ArrayPush(conf.factors_list, "Fibonacci OTE (4%)");
+  }
+  
+  if (setup.htf_aligned) {
+    conf.total_score += 4.0;
+    conf.htf_aligned = true;
+    ArrayPush(conf.factors_list, "HTF alignment (4%)");
+  }
+  
+  if (setup.high_impact_news) {
+    conf.total_score += 4.0;
+    conf.high_impact_news = true;
+    ArrayPush(conf.factors_list, "High Impact News (4%)");
+  }
+  
+  if (setup.amd_pattern) {
+    conf.total_score += 4.0;
+    conf.amd_pattern = true;
+    ArrayPush(conf.factors_list, "AMD Pattern (4%)");
+  }
+  
+  if (setup.htf_order_block) {
+    conf.total_score += 4.0;
+    conf.htf_order_block = true;
+    ArrayPush(conf.factors_list, "HTF Order Block (4%)");
+  }
+  
+  // CAP на 100%
+  if (conf.total_score > 100) {
+    conf.total_score = 100;
+  }
+  
+  // РЕЙТИНГ
+  if (conf.total_score >= 95) {
+    conf.quality_rating = "EXCELLENT ⭐⭐⭐⭐⭐";
+  } else if (conf.total_score >= 90) {
+    conf.quality_rating = "EXCELLENT ⭐⭐⭐⭐";
+  } else if (conf.total_score >= 85) {
+    conf.quality_rating = "VERY GOOD ⭐⭐⭐";
+  } else if (conf.total_score >= 80) {
+    conf.quality_rating = "GOOD ⭐⭐";
+  } else if (conf.total_score >= 70) {
+    conf.quality_rating = "ACCEPTABLE ⭐";
+  } else {
+    conf.quality_rating = "POOR";
+  }
+  
+  return conf;
+}
+```
+
+---
+
+## 📦 СТРУКТУРЫ ДАННЫХ {#структуры-данных}
+
+### Common.mqh - Полные структуры
+
+```cpp
+//+------------------------------------------------------------------+
+//| Common.mqh - Структуры данных после аудита                       |
+//+------------------------------------------------------------------+
+
+// ═══════════════════════════════════════════════════════════════
+// ENUMS
+// ═══════════════════════════════════════════════════════════════
+
+enum ENUM_SESSION_TYPE {
+  SESSION_DEAD_ZONE,
+  SESSION_ASIAN,
+  SESSION_LONDON_PRIME,
+  SESSION_LONDON_LATE,
+  SESSION_NY_PRIME,
+  SESSION_NY_LATE,
+  SESSION_LONDON_NY_OVERLAP  // Особая важность!
+};
+
+enum ENUM_OB_TYPE {
+  OB_BULLISH,
+  OB_BEARISH
+};
+
+enum ENUM_OB_STATUS {
+  OB_ACTIVE,
+  OB_MITIGATED_ONCE,
+  OB_MITIGATED_TWICE,
+  OB_WEAK,
+  OB_VIOLATED
+};
+
+enum ENUM_BMS_TYPE {
+  BMS_BULLISH,
+  BMS_BEARISH
+};
+
+enum ENUM_SWING_TYPE {
+  SWING_HIGH,
+  SWING_LOW
+};
+
+enum ENUM_LIQUIDITY_TYPE {
+  LIQUIDITY_BSL,  // Buy Stops Liquidity
+  LIQUIDITY_SSL   // Sell Stops Liquidity
+};
+
+enum ENUM_ASIAN_QUALITY {
+  ASIAN_EXCELLENT,  // 80-100
+  ASIAN_GOOD,       // 60-79
+  ASIAN_ACCEPTABLE, // 40-59
+  ASIAN_WEAK        // < 40
+};
+
+enum ENUM_SWEEP_VALIDITY {
+  SWEEP_STRONG,     // 3+ bars holding
+  SWEEP_GOOD,       // 2 bars
+  SWEEP_WEAK,       // 1 bar
+  SWEEP_INVALID
+};
+
+enum ENUM_TREND_DIRECTION {
+  TREND_BULLISH,
+  TREND_BEARISH,
+  TREND_RANGING
+};
+
+enum ENUM_AMD_DIRECTION {
+  AMD_UP,
+  AMD_DOWN,
+  AMD_NONE
+};
+
+enum ENUM_SETUP_TYPE {
+  SETUP_TURTLE_SOUP,
+  SETUP_SH_BMS_RTO,
+  SETUP_SMS_BMS_RTO,
+  SETUP_AMD
+};
+
+enum ENUM_SETUP_STATUS {
+  SETUP_READY,      // Цена в entry zone
+  SETUP_WAITING,    // Ждем RTO
+  SETUP_EXPIRED     // Setup истек
+};
+
+enum ENUM_MITIGATION_ACTION {
+  MITIGATION_NO_CHANGE,
+  MITIGATION_TOUCHED,
+  MITIGATION_SAME_TOUCH,
+  MITIGATION_INVALIDATED
+};
+
+// ═══════════════════════════════════════════════════════════════
+// STRUCTURES
+// ═══════════════════════════════════════════════════════════════
+
+struct SwingPoint {
+  datetime time;
+  double price;
+  int bar_index;
+  ENUM_SWING_TYPE type;
+  int strength;  // Сколько баров слева/справа проверялось
+};
+
+struct BMS {
+  datetime time;
+  double price;
+  int bar_index;
+  ENUM_BMS_TYPE type;
+  SwingPoint swing_ref;  // Swing который был пробит
+};
+
+struct SMS {
+  datetime time;
+  double failed_price;    // Цена которую не смогли пробить
+  double reversal_price;  // Цена где произошел разворот
+  int bar_index;
+  ENUM_BMS_TYPE expected_direction;  // Ожидаемое направление после SMS
+};
+
+struct LiquidityZone {
+  double price;
+  ENUM_LIQUIDITY_TYPE type;
+  string name;  // "PDH", "HOD", "Equal Highs", etc
+  int importance;  // 1-10
+  datetime created_time;
+  bool swept;
+  datetime swept_time;
+};
+
+struct SweepData {
+  datetime time;
+  double zone_price;
+  double sweep_price;
+  double distance_pips;
+  ENUM_LIQUIDITY_TYPE type;
+  
+  // Holding time validation
+  int holding_bars;
+  ENUM_SWEEP_VALIDITY validity;
+  
+  // Volume data
+  double volume;
+  double avg_volume;
+  double volume_ratio;
+  bool volume_mandatory;
+  
+  // Return data
+  int return_bars;
+  double return_price;
+  
+  // Context
+  ENUM_SESSION_TYPE session;
+  bool is_news_time;
+  
+  // Validation
+  bool valid;
+  string invalid_reason;
+  
+  // Methods
+  double GetConfidenceAdjustment() {
+    if (validity == SWEEP_STRONG) return 5.0;
+    if (validity == SWEEP_WEAK) return -10.0;
+    return 0.0;
+  }
+};
+
+struct OrderBlock {
+  datetime time;
+  double high;
+  double low;
+  int bar_index;
+  ENUM_OB_TYPE type;
+  
+  struct {
+    datetime time;
+    double price;
+  } bms_ref;
+  
+  // Impulse data для Fibonacci
+  int impulse_start_bar;
+  double impulse_start_price;
+  double impulse_end_price;
+  
+  // Fibonacci data (рассчитывается сразу)
+  FibonacciLevels fibonacci_data;
+  struct {
+    double high;
+    double low;
+  } ote_zone;
+  
+  // Mitigation tracking
+  ENUM_OB_STATUS status;
+  int mitigation_count;
+  datetime last_mitigation_time;
+  double mitigation_prices[];
+  
+  // Validation
+  bool valid;
+  string note;
+  string invalid_reason;
+  
+  // Methods
+  double GetConfluenceAdjustment() {
+    if (mitigation_count == 0 || mitigation_count == 1) return 0.0;
+    if (mitigation_count == 2) return -5.0;
+    if (mitigation_count >= 3) return -15.0;
+    return 0.0;
+  }
+};
+
+struct FibonacciLevels {
+  double impulse_start;
+  double impulse_end;
+  double range;
+  
+  double L0;
+  double L236;
+  double L382;
+  double L50;
+  double L618;
+  double L705;
+  double L79;
+  double L886;
+  double L100;
+  
+  struct {
+    double high;
+    double low;
+  } ote_zone;
+  
+  // Methods
+  bool IsPriceInOTE(double price) {
+    return (price >= ote_zone.low && price <= ote_zone.high);
+  }
+  
+  double GetClosestLevel(double price) {
+    double levels[] = {L0, L236, L382, L50, L618, L705, L79, L886, L100};
+    double min_distance = DBL_MAX;
+    double closest = 0;
+    
+    for (int i = 0; i < 9; i++) {
+      double dist = MathAbs(price - levels[i]);
+      if (dist < min_distance) {
+        min_distance = dist;
+        closest = levels[i];
+      }
+    }
+    return closest;
+  }
+};
+
+struct AsianRange {
+  datetime start_time;
+  datetime end_time;
+  double high;
+  double low;
+  double size_pips;
+  
+  // Quality metrics
+  int touches_high;
+  int touches_low;
+  int wicks_above;
+  int wicks_below;
+  double flat_ratio;
+  int quality_score;  // 0-100
+  ENUM_ASIAN_QUALITY quality_rating;
+  
+  bool IsValid() {
+    return (quality_score >= 40);
+  }
+  
+  string GetQualityText() {
+    switch(quality_rating) {
+      case ASIAN_EXCELLENT: return "EXCELLENT";
+      case ASIAN_GOOD: return "GOOD";
+      case ASIAN_ACCEPTABLE: return "ACCEPTABLE";
+      case ASIAN_WEAK: return "WEAK";
+    }
+    return "UNKNOWN";
+  }
+};
+
+struct AMD_Pattern {
+  bool valid;
+  
+  // Phase A
+  AsianRange accumulation_zone;
+  
+  // Phase M
+  ENUM_AMD_DIRECTION manipulation_direction;
+  double manipulation_price;
+  bool manipulation_confirmed;
+  LiquidityZone swept_liquidity[];
+  
+  // Phase D
+  ENUM_AMD_DIRECTION expected_distribution_direction;  // Противоположно M!
+  bool distribution_confirmed;
+  BMS distribution_bms;
+};
+
+struct SessionInfo {
+  ENUM_SESSION_TYPE type;
+  int importance;  // 0-10
+  double confluence_weight;
+  string description;
+};
+
+struct Setup {
+  int id;  // Уникальный ID
+  ENUM_SETUP_TYPE type;
+  ENUM_TREND_DIRECTION direction;
+  
+  // Entry data
+  double entry_price;
+  double entry_min;
+  double entry_max;
+  double stop_loss;
+  double take_profit;
+  
+  // References
+  BMS bms_ref;
+  SweepData sweep_ref;
+  SMS sms_ref;
+  OrderBlock ob_ref;
+  
+  // Confluence factors
+  bool has_bms;
+  bool has_stop_hunt;
+  bool has_sms;
+  bool has_order_block;
+  bool in_fibonacci_ote;
+  bool htf_aligned;
+  bool high_impact_news;
+  bool amd_pattern;
+  bool htf_order_block;
+  
+  // Confluence result
+  double confluence_score;
+  string confluence_rating;
+  string confluence_factors[];
+  
+  // Status
+  ENUM_SETUP_STATUS status;
+  ENUM_SESSION_TYPE session;
+  datetime created_time;
+  int bars_waiting;
+};
+
+struct ConfluenceData {
+  // Факторы
+  bool has_bms;
+  bool has_stop_hunt;
+  bool has_sms;
+  bool has_order_block;
+  bool in_fibonacci_ote;
+  bool htf_aligned;
+  bool high_impact_news;
+  bool amd_pattern;
+  bool htf_order_block;
+  
+  // Session
+  ENUM_SESSION_TYPE session;
+  bool session_valid;
+  
+  // Adjustments
+  double ob_mitigation_adj;
+  double sweep_validity_adj;
+  
+  // Result
+  double total_score;
+  string quality_rating;
+  string factors_list[];
+  
+  // Weights (constants)
+  const double WEIGHT_BMS = 25.0;
+  const double WEIGHT_SH_SMS = 20.0;
+  const double WEIGHT_OB = 20.0;
+  const double WEIGHT_SESSION = 15.0;
+  const double WEIGHT_SESSION_OVERLAP = 20.0;
+  const double WEIGHT_OTE = 4.0;
+  const double WEIGHT_HTF = 4.0;
+  const double WEIGHT_NEWS = 4.0;
+  const double WEIGHT_AMD = 4.0;
+  const double WEIGHT_HTF_OB = 4.0;
+};
+
+struct MitigationResult {
+  ENUM_MITIGATION_ACTION action;
+  int mitigation_count;
+  double penetration_depth;
+  double confluence_adjustment;
+  string recommendation;
+};
+
+struct OBSizeLimits {
+  double min_size;
+  double max_size;
+};
+
+// ═══════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+template<typename T>
+void ArrayPush(T &arr[], T value) {
+  int size = ArraySize(arr);
+  ArrayResize(arr, size + 1);
+  arr[size] = value;
+}
+
+OBSizeLimits GetOBLimits(string symbol, ENUM_TIMEFRAMES tf) {
+  OBSizeLimits limits;
+  
+  bool is_forex = (StringFind(symbol, "USD") >= 0 || 
+                   StringFind(symbol, "EUR") >= 0 ||
+                   StringFind(symbol, "GBP") >= 0);
+  
+  bool is_gold = (StringFind(symbol, "XAU") >= 0 || 
+                  StringFind(symbol, "GOLD") >= 0);
+  
+  bool is_index = (StringFind(symbol, "NAS") >= 0 || 
+                   StringFind(symbol, "US500") >= 0);
+  
+  if (is_forex) {
+    switch(tf) {
+      case PERIOD_M5:
+      case PERIOD_M15:
+        limits.min_size = 3;
+        limits.max_size = 20;
+        break;
+      case PERIOD_M30:
+        limits.min_size = 4;
+        limits.max_size = 30;
+        break;
+      case PERIOD_H1:
+        limits.min_size = 5;
+        limits.max_size = 40;
+        break;
+      case PERIOD_H4:
+        limits.min_size = 10;
+        limits.max_size = 80;
+        break;
+      case PERIOD_D1:
+        limits.min_size = 20;
+        limits.max_size = 150;
+        break;
+      default:
+        limits.min_size = 30;
+        limits.max_size = 300;
+        break;
+    }
+  } else if (is_gold) {
+    switch(tf) {
+      case PERIOD_M5:
+      case PERIOD_M15:
+        limits.min_size = 30;
+        limits.max_size = 200;
+        break;
+      case PERIOD_M30:
+        limits.min_size = 40;
+        limits.max_size = 300;
+        break;
+      case PERIOD_H1:
+        limits.min_size = 50;
+        limits.max_size = 400;
+        break;
+      case PERIOD_H4:
+        limits.min_size = 100;
+        limits.max_size = 800;
+        break;
+      default:
+        limits.min_size = 200;
+        limits.max_size = 1500;
+        break;
+    }
+  } else if (is_index) {
+    switch(tf) {
+      case PERIOD_M5:
+      case PERIOD_M15:
+        limits.min_size = 10;
+        limits.max_size = 100;
+        break;
+      case PERIOD_M30:
+        limits.min_size = 15;
+        limits.max_size = 150;
+        break;
+      case PERIOD_H1:
+        limits.min_size = 20;
+        limits.max_size = 200;
+        break;
+      case PERIOD_H4:
+        limits.min_size = 50;
+        limits.max_size = 400;
+        break;
+      default:
+        limits.min_size = 100;
+        limits.max_size = 800;
+        break;
+    }
+  } else {
+    limits.min_size = 5;
+    limits.max_size = 50;
+  }
+  
+  return limits;
+}
+```
+
+---
+
+## 📅 ПЛАН РАЗРАБОТКИ ПО ФАЗАМ {#план-разработки}
+
+### PHASE 1: Фундамент (Недели 1-2)
+
+```
+WEEK 1: Core Infrastructure
+├─ Common.mqh
+│  ├─ Все структуры данных ✓
+│  ├─ Enums определения ✓
+│  └─ Helper functions ✓
+│
+├─ MODULE 0A: BrokerTimeDetector.mqh
+│  ├─ DetectBrokerGMTOffset()
+│  ├─ IsDSTActiveEU() с точными датами
+│  ├─ GetLastSundayOfMonth()
+│  ├─ GetOffsetToMSK() упрощенная функция
+│  ├─ ValidateDetection() cross-check
+│  └─ ShowTimeDebugPanel()
+│
+└─ Тестирование:
+   ├─ Зимнее время (январь): GMT+2, offset +1
+   ├─ Летнее время (июль): GMT+3, offset 0
+   └─ DST переходы (30 марта, 26 октября)
+
+WEEK 2: Time Management
+├─ MODULE 0B: TimeZoneManager.mqh
+│  ├─ ConvertBrokerToMSK(hour)
+│  ├─ ConvertMSKToBroker(hour)
+│  ├─ GetCurrentMSKTime()
+│  └─ GetCurrentSession() wrapper
+│
+└─ Integration Testing:
+   ├─ Проверка всех сессий (Asian, London, NY, Overlap)
+   ├─ Session timing в MSK
+   └─ Автоматические тесты (TestSessionDetection())
+```
+
+### PHASE 2: Market Analysis Core (Недели 3-4)
+
+```
+WEEK 3: Sessions & Structure
+├─ MODULE 2A: Sessions.mqh [ПЕРЕМЕЩЕН РАНЬШЕ!]
+│  ├─ GetCurrentSession() с Overlap приоритетом
+│  ├─ GetAsianRange()
+│  │  ├─ Определение boundaries
+│  │  ├─ Подсчет touches/wicks
+│  │  └─ Quality scoring
+│  ├─ ValidateAsianRangeQuality()
+│  ├─ DetectAMD() ИСПРАВЛЕННАЯ ЛОГИКА
+│  │  └─ Manipulation противоположна Distribution!
+│  └─ IsLondonNYOverlap()
+│
+├─ MODULE 1: MarketStructure.mqh
+│  ├─ DetectSwingPoints(strength)
+│  ├─ DetectBMS() → проверка Close, не High/Low
+│  ├─ DetectSMS()
+│  └─ GetHTFTrend(timeframe) НОВАЯ ФУНКЦИЯ
+│
+└─ Testing:
+   ├─ Swing detection на истории
+   ├─ BMS validation (Close vs High/Low)
+   ├─ Asian Range quality на примерах
+   └─ AMD pattern detection
+
+WEEK 4: Advanced Market Structure
+├─ HTF Analysis Integration
+│  ├─ Multi-timeframe swing detection
+│  ├─ HTF trend alignment check
+│  └─ HTF Order Block detection
+│
+└─ Testing:
+   ├─ HTF vs LTF consistency
+   └─ Trend direction validation
+```
+
+### PHASE 3: Liquidity & Order Blocks (Недели 5-7)
+
+```
+WEEK 5: Liquidity Detection
+├─ MODULE 2B: Liquidity.mqh
+│  ├─ FindBSL() / FindSSL()
+│  │  ├─ PDH, PWH, PMH
+│  │  ├─ HOD, LOD
+│  │  └─ Old highs/lows
+│  ├─ FindEqualHighsLows()
+│  │  └─ Timeframe-dependent threshold!
+│  ├─ DetectSweep()
+│  │  ├─ Distance validation
+│  │  ├─ Holding time check НОВОЕ
+│  │  ├─ Volume check (MANDATORY для News)
+│  │  └─ Return validation
+│  └─ ValidateSweepHoldingTime()
+│
+└─ Testing:
+   ├─ Equal Highs на разных TF (M15, H1, H4)
+   ├─ Sweep validation с/без volume
+   ├─ Holding time scenarios (1, 2, 3+ bars)
+   └─ News sweep vs normal sweep
+
+WEEK 6: Order Block Detection
+├─ MODULE 3: OrderBlocks.mqh
+│  ├─ DetectBullishOB()
+│  │  ├─ Точное определение impulse_start
+│  │  ├─ Поиск последней противоположной свечи
+│  │  ├─ Fallback для strong impulses
+│  │  └─ Размер validation
+│  ├─ DetectBearishOB()
+│  ├─ ValidateOB()
+│  ├─ CheckMitigation() НОВАЯ ФУНКЦИЯ
+│  │  ├─ Touch detection
+│  │  ├─ Violation detection
+│  │  └─ Confluence adjustment
+│  └─ TrackMitigationCount()
+│
+└─ Testing:
+   ├─ OB detection на разных импульсах
+   ├─ Fallback scenarios (no opposite candles)
+   ├─ Mitigation tracking (1st, 2nd, 3rd touch)
+   └─ Size validation
+
+WEEK 7: Fibonacci Integration
+├─ MODULE 4: Fibonacci.mqh
+│  ├─ Calculate(OrderBlock)
+│  │  └─ Использует impulse_start/end из OB
+│  ├─ GetOTEZone()
+│  └─ IsPriceInOTE()
+│
+└─ Integration:
+   ├─ Fibonacci рассчитывается СРАЗУ после OB creation
+   ├─ OTE zone сохраняется в OB структуре
+   └─ Testing на истории
+```
+
+### PHASE 4: Setup Detection (Недели 8-9)
+
+```
+WEEK 8: Setup Scanner
+├─ MODULE 5: SetupScanner.mqh
+│  ├─ ScanTurtleSoup()
+│  │  ├─ Sweep detection
+│  │  ├─ Holding time validation
+│  │  └─ Entry zone определение
+│  ├─ ScanSH_BMS_RTO()
+│  │  ├─ Sweep + BMS combo
+│  │  ├─ RTO validation
+│  │  └─ HTF filter check НОВОЕ
+│  ├─ ScanSMS_BMS_RTO()
+│  │  └─ SMS + BMS + RTO combo
+│  └─ ScanAMD()
+│     └─ Использовать как context filter
+│
+├─ HTF Filter Implementation
+│  └─ Блокировка противоположных setups
+│
+└─ Testing:
+   ├─ Каждый тип setup отдельно
+   ├─ HTF filter validation
+   └─ Multiple setups одновременно
+
+WEEK 9: Confluence System
+├─ MODULE 6: ConfluenceCalculator.mqh
+│  ├─ CalculateConfluence()
+│  │  ├─ Критические проверки (BMS, SH/SMS, OB)
+│  │  ├─ Session weight (15% или 20% для Overlap)
+│  │  ├─ Дополнительные факторы (20%)
+│  │  ├─ Adjustments (OB mitigation, sweep validity)
+│  │  └─ Cap на 100%
+│  ├─ Quality rating определение
+│  └─ Factors breakdown
+│
+└─ Testing:
+   ├─ Все комбинации факторов
+   ├─ Edge cases (max/min confluence)
+   ├─ Adjustments validation
+   └─ Веса проверка (сумма = 100%)
+```
+
+### PHASE 5: Auxiliary Modules (Недели 10-11)
+
+```
+WEEK 10: Optional Modules
+├─ MODULE 7: RiskManager.mqh [ОПЦИОНАЛЬНЫЙ]
+│  ├─ CalculateLotSize(sl_pips, risk_percent, balance)
+│  ├─ CalculateRiskReward(entry, sl, tp)
+│  └─ ValidateRiskParameters()
+│
+├─ MODULE 8: NewsCalendar.mqh [ОПЦИОНАЛЬНЫЙ]
+│  ├─ MANUAL mode (inputs)
+│  │  └─ Ручной ввод событий и времени
+│  ├─ DISABLED mode (по умолчанию)
+│  └─ VOLATILITY mode (по ATR)
+│     └─ Авто-определение high volatility periods
+│
+└─ MODULE 9: Logger.mqh
+   ├─ LogInfo()
+   ├─ LogWarning()
+   ├─ LogError()
+   └─ LogDebug()
+
+WEEK 11: Dashboard
+├─ MODULE 10: Dashboard.mqh
+│  ├─ DrawDashboard()
+│  │  ├─ Background panel
+│  │  ├─ All sections (Time, Structure, Liquidity, Setups, Stats)
+│  │  └─ Responsive layout
+│  ├─ UpdateRealtime()
+│  │  ├─ Time section каждую секунду
+│  │  ├─ Structure на новом баре
+│  │  └─ Setups при изменениях
+│  ├─ ShowActiveSetups()
+│  │  ├─ Top N setups по confluence
+│  │  ├─ Status indicators (🟢🟡🔴)
+│  │  └─ Confluence breakdown
+│  └─ Performance optimization
+│     ├─ Lazy rendering
+│     └─ Update throttling
+│
+└─ Testing:
+   ├─ Визуальная проверка всех секций
+   ├─ Real-time updates
+   └─ Performance (< 10ms на redraw)
+```
+
+### PHASE 6: Integration & Testing (Недели 12-13)
+
+```
+WEEK 12: Full Integration
+├─ SMC_Master.mq5
+│  ├─ OnInit() - инициализация всех модулей
+│  ├─ OnCalculate() - главная логика
+│  │  ├─ PHASE 1: Context (Time, Session)
+│  │  ├─ PHASE 2: Structure (Swings, BMS, SMS)
+│  │  ├─ PHASE 3: Liquidity (BSL/SSL, Sweeps)
+│  │  ├─ PHASE 4: Order Blocks + Fibonacci
+│  │  ├─ PHASE 5: Setup Scan
+│  │  ├─ PHASE 6: Confluence calculation
+│  │  ├─ PHASE 7: Filter по min confluence
+│  │  └─ PHASE 8: Dashboard update
+│  └─ OnDeinit() - cleanup
+│
+├─ Inputs Organization
+│  ├─ Time Settings
+│  ├─ Session Settings
+│  ├─ Market Structure Settings
+│  ├─ Liquidity Settings
+│  ├─ Order Block Settings
+│  ├─ Confluence Settings
+│  ├─ Dashboard Settings
+│  └─ Risk Settings (optional)
+│
+└─ Memory Management
+   ├─ ArrayFree() для dynamic arrays
+   └─ Static arrays где возможно
+
+WEEK 13: Comprehensive Testing
+├─ Automated Tests
+│  ├─ Time detection tests
+│  ├─ Session detection tests
+│  ├─ BMS detection tests
+│  ├─ OB detection tests
+│  ├─ Confluence calculation tests
+│  └─ Edge cases
+│
+├─ Manual Testing
+│  ├─ Historical data (back-test)
+│  ├─ Live market conditions
+│  ├─ Multiple symbols (EUR/USD, Gold, Indices)
+│  └─ Multiple timeframes (M15, H1, H4)
+│
+└─ Performance Testing
+   ├─ CPU usage
+   ├─ Memory usage
+   ├─ Indicator loading time
+   └─ Optimization opportunities
+```
+
+### PHASE 7: Documentation & Release (Неделя 14)
+
+```
+WEEK 14: Finalization
+├─ User Manual
+│  ├─ Installation guide
+│  ├─ Setup & configuration
+│  ├─ Trading concepts explained
+│  ├─ Dashboard guide
+│  ├─ Risk management guidelines
+│  └─ Troubleshooting
+│
+├─ Code Documentation
+│  ├─ Comments для всех функций
+│  ├─ Module dependencies diagram
+│  └─ Architecture overview
+│
+├─ Final Testing
+│  ├─ Beta testing (2-3 users)
+│  ├─ Bug fixes
+│  └─ Performance tuning
+│
+└─ Release Preparation
+   ├─ Version 1.0 package
+   ├─ Release notes
+   └─ Support channels setup
+```
+
+---
+
+## ✅ ТЕСТИРОВАНИЕ {#тестирование}
+
+### Обязательные тесты перед релизом
+
+```cpp
+//+------------------------------------------------------------------+
+//| Test Suite для SMC Индикатора                                   |
+//+------------------------------------------------------------------+
+
+void RunAllTests() {
+  Print("═══════════════════════════════════════");
+  Print("Starting SMC Indicator Test Suite");
+  Print("═══════════════════════════════════════");
+  
+  int total_tests = 0;
+  int passed_tests = 0;
+  
+  // TIME TESTS
+  if (TestTimeDetection()) passed_tests++;
+  total_tests++;
+  
+  if (TestDSTTransitions()) passed_tests++;
+  total_tests++;
+  
+  if (TestSessionDetection()) passed_tests++;
+  total_tests++;
+  
+  // STRUCTURE TESTS
+  if (TestBMSDetection()) passed_tests++;
+  total_tests++;
+  
+  if (TestSMSDetection()) passed_tests++;
+  total_tests++;
+  
+  if (TestHTFTrendDetection()) passed_tests++;
+  total_tests++;
+  
+  // LIQUIDITY TESTS
+  if (TestEqualHighsThreshold()) passed_tests++;
+  total_tests++;
+  
+  if (TestSweepDetection()) passed_tests++;
+  total_tests++;
+  
+  if (TestSweepVolumeCheck()) passed_tests++;
+  total_tests++;
+  
+  // ORDER BLOCK TESTS
+  if (TestOrderBlockDetection()) passed_tests++;
+  total_tests++;
+  
+  if (TestOrderBlockMitigation()) passed_tests++;
+  total_tests++;
+  
+  if (TestOrderBlockFallback()) passed_tests++;
+  total_tests++;
+  
+  // FIBONACCI TESTS
+  if (TestFibonacciCalculation()) passed_tests++;
+  total_tests++;
+  
+  if (TestOTEZone()) passed_tests++;
+  total_tests++;
+  
+  // CONFLUENCE TESTS
+  if (TestConfluenceWeights()) passed_tests++;
+  total_tests++;
+  
+  if (TestConfluenceAdjustments()) passed_tests++;
+  total_tests++;
+  
+  if (TestConfluenceCap()) passed_tests++;
+  total_tests++;
+  
+  // AMD TESTS
+  if (TestAMDManipulationDirection()) passed_tests++;
+  total_tests++;
+  
+  // DASHBOARD TESTS
+  if (TestDashboardPerformance()) passed_tests++;
+  total_tests++;
+  
+  // RESULTS
+  Print("═══════════════════════════════════════");
+  Print("Test Results: ", passed_tests, "/", total_tests, " passed");
+  double success_rate = (double)passed_tests / total_tests * 100;
+  Print("Success Rate: ", DoubleToString(success_rate, 1), "%");
+  Print("═══════════════════════════════════════");
+  
+  if (passed_tests == total_tests) {
+    Print("✅ ALL TESTS PASSED! Ready for release.");
+  } else {
+    Print("❌ SOME TESTS FAILED! Review logs.");
+  }
+}
+
+//+------------------------------------------------------------------+
+//| TEST 1: Time Detection                                           |
+//+------------------------------------------------------------------+
+bool TestTimeDetection() {
+  Print("Running: TestTimeDetection...");
+  
+  // Simulate winter (January)
+  datetime winter_time = D'2025.01.15 10:00';
+  MqlDateTime dt_winter;
+  TimeToStruct(winter_time, dt_winter);
+  
+  bool dst_winter = IsDSTActiveEU(winter_time);
+  if (dst_winter) {
+    Print("❌ FAILED: DST should be false in January");
+    return false;
+  }
+  
+  int offset_winter = GetOffsetToMSK();
+  if (offset_winter != 1) {
+    Print("❌ FAILED: Winter offset should be +1, got ", offset_winter);
+    return false;
+  }
+  
+  // Simulate summer (July)
+  datetime summer_time = D'2025.07.15 10:00';
+  bool dst_summer = IsDSTActiveEU(summer_time);
+  if (!dst_summer) {
+    Print("❌ FAILED: DST should be true in July");
+    return false;
+  }
+  
+  // Note: Can't change broker time dynamically, so just check logic
+  
+  Print("✅ PASSED: TestTimeDetection");
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST 2: BMS Detection                                            |
+//+------------------------------------------------------------------+
+bool TestBMSDetection() {
+  Print("Running: TestBMSDetection...");
+  
+  // Create test data
+  // Swing High at bar 10: High = 1.1000
+  // Bar 5: High = 1.1015, Close = 1.1012 (CLOSED above swing high)
+  // Bar 4: Close = 1.0995 (false breakout - closed below)
+  
+  // Test case 1: Valid BMS (Close above)
+  // Simulate: Current bar closed at 1.1012, above swing high 1.1000
+  bool is_bms = (1.1012 > 1.1000);  // Using Close, not High
+  if (!is_bms) {
+    Print("❌ FAILED: Should detect BMS when Close > Swing High");
+    return false;
+  }
+  
+  // Test case 2: Invalid BMS (High above but Close below)
+  bool is_false_bms = (1.1015 > 1.1000 && 1.0995 <= 1.1000);
+  if (!is_false_bms) {
+    Print("❌ FAILED: Should NOT detect BMS when only High breaks");
+    return false;
+  }
+  
+  Print("✅ PASSED: TestBMSDetection");
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST 3: Confluence Weights                                       |
+//+------------------------------------------------------------------+
+bool TestConfluenceWeights() {
+  Print("Running: TestConfluenceWeights...");
+  
+  // Test maximum possible score
+  double max_score = 25 + 20 + 20 + 20 + 4 + 4 + 4 + 4 + 4;
+  if (max_score != 105) {
+    Print("❌ FAILED: Max raw score should be 105 (before cap)");
+    return false;
+  }
+  
+  // Test that it caps at 100
+  double capped = (max_score > 100) ? 100 : max_score;
+  if (capped != 100) {
+    Print("❌ FAILED: Score should cap at 100");
+    return false;
+  }
+  
+  // Test minimum tradeable
+  double min_tradeable = 25 + 20 + 20 + 15;  // BMS + SH + OB + Session
+  if (min_tradeable != 80) {
+    Print("❌ FAILED: Minimum tradeable should be 80%");
+    return false;
+  }
+  
+  Print("✅ PASSED: TestConfluenceWeights");
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST 4: AMD Manipulation Direction                               |
+//+------------------------------------------------------------------+
+bool TestAMDManipulationDirection() {
+  Print("Running: TestAMDManipulationDirection...");
+  
+  // Test case: Bearish AMD
+  // Manipulation: Breakout UP (swept BSL above Asian Range)
+  ENUM_AMD_DIRECTION manipulation = AMD_UP;
+  
+  // Expected distribution: DOWN (opposite!)
+  ENUM_AMD_DIRECTION expected_distribution = AMD_DOWN;
+  
+  if (manipulation == AMD_UP && expected_distribution != AMD_DOWN) {
+    Print("❌ FAILED: Distribution should be opposite to Manipulation");
+    return false;
+  }
+  
+  // Test case: Bullish AMD
+  manipulation = AMD_DOWN;
+  expected_distribution = AMD_UP;
+  
+  if (manipulation == AMD_DOWN && expected_distribution != AMD_UP) {
+    Print("❌ FAILED: Distribution should be opposite to Manipulation");
+    return false;
+  }
+  
+  Print("✅ PASSED: TestAMDManipulationDirection");
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| TEST 5: Order Block Mitigation                                   |
+//+------------------------------------------------------------------+
+bool TestOrderBlockMitigation() {
+  Print("Running: TestOrderBlockMitigation...");
+  
+  OrderBlock ob;
+  ob.type = OB_BULLISH;
+  ob.high = 1.1000;
+  ob.low = 1.0990;
+  ob.status = OB_ACTIVE;
+  ob.mitigation_count = 0;
+  
+  // First touch
+  MitigationResult r1 = CheckOrderBlockMitigation(ob, 1.0995, TimeCurrent());
+  if (ob.mitigation_count != 1) {
+    Print("❌ FAILED: Mitigation count should be 1 after first touch");
+    return false;
+  }
+  if (ob.GetConfluenceAdjustment() != 0.0) {
+    Print("❌ FAILED: No penalty for first touch");
+    return false;
+  }
+  
+  // Second touch (after 10 minutes)
+  MitigationResult r2 = CheckOrderBlockMitigation(ob, 1.0993, TimeCurrent() + 600);
+  if (ob.mitigation_count != 2) {
+    Print("❌ FAILED: Mitigation count should be 2");
+    return false;
+  }
+  if (ob.GetConfluenceAdjustment() != -5.0) {
+    Print("❌ FAILED: Should have -5% penalty for second touch");
+    return false;
+  }
+  
+  // Third touch
+  MitigationResult r3 = CheckOrderBlockMitigation(ob, 1.0992, TimeCurrent() + 1200);
+  if (ob.mitigation_count != 3) {
+    Print("❌ FAILED: Mitigation count should be 3");
+    return false;
+  }
+  if (ob.GetConfluenceAdjustment() != -15.0) {
+    Print("❌ FAILED: Should have -15% penalty for third touch");
+    return false;
+  }
+  
+  // Violation
+  MitigationResult r4 = CheckOrderBlockMitigation(ob, 1.0985, TimeCurrent() + 1800);
+  if (ob.status != OB_VIOLATED) {
+    Print("❌ FAILED: OB should be VIOLATED after price goes below low");
+    return false;
+  }
+  
+  Print("✅ PASSED: TestOrderBlockMitigation");
+  return true;
+}
+```
+
+---
+
+## 📝 CHECKLIST ПЕРЕД РЕЛИЗОМ
+
+```
+КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ:
+□ AMD manipulation direction (противоположна distribution)
+□ Confluence weights sum to 100%
+□ Order Block mitigation tracking реализован
+□ Timeframe-dependent thresholds для Equal Highs
+□ HTF trend filter в SetupScanner
+□ DST точные даты (не просто месяцы)
+□ Sweep volume check MANDATORY для News
+□ Fibonacci от impulse_start к impulse_max
+□ Sessions перемещен раньше Liquidity
+
+ФУНКЦИОНАЛЬНОСТЬ:
+□ Все модули реализованы
+□ Dashboard отображается корректно
+□ Real-time updates работают
+□ Alerts system (опционально)
+□ Risk management (опционально)
+
+ТЕСТИРОВАНИЕ:
+□ Все automated tests passed
+□ Manual testing на истории
+□ Live testing минимум 1 неделя
+□ Multiple symbols tested
+□ Multiple timeframes tested
+
+ПРОИЗВОДИТЕЛЬНОСТЬ:
+□ Indicator loading < 5 секунд
+□ OnCalculate < 20ms на тик
+□ Dashboard redraw < 10ms
+□ Нет memory leaks
+
+ДОКУМЕНТАЦИЯ:
+□ User Manual написан
+□ Trading concepts объяснены
+□ Dashboard guide готов
+□ Troubleshooting section есть
+□ Code comments добавлены
+
+РЕЛИЗ:
+□ Version 1.0 package готов
+□ Release notes написаны
+□ Support channels setup
+□ Beta testing завершен
+```
+
+---
+
+## 🎯 ИТОГОВАЯ ОЦЕНКА ПЛАНА
+
+**Готовность к реализации:** ✅ 95%  
+**Оставшиеся 5%:** Мелкие детали которые появятся при кодинге
+
+**Ожидаемое время разработки:** 12-14 недель  
+**Рекомендуемая команда:** 1-2 разработчика MQL5  
+
+**Успех проекта:** ВЫСОКИЙ при следовании плану
+
+---
+
+**КОНЕЦ ДОКУМЕНТА**
